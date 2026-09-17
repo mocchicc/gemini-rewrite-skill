@@ -1,0 +1,6 @@
+interface:
+  display_name: "Gemini Rewrite"
+  short_description: "Gemini 3.8で文章を推敲し、原文との違いを確認する"
+  default_prompt: "Use $gemini-rewrite to rewrite the selected text with Gemini 3.8 Flash, preserve its meaning, and review the diff."
+policy:
+  allow_implicit_invocation: false
