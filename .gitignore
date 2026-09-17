@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Generated rewrite outputs
+*.rewritten.md
+*.rewritten.txt
+*.rewritten.md.diff
+*.rewritten.txt.diff
+*.report.json
+
+# Editors
+.vscode/
+.idea/
