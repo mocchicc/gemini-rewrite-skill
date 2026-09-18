@@ -36,6 +36,34 @@ class RewriteTests(unittest.TestCase):
         self.assertEqual(p["generationConfig"], {"maxOutputTokens": 32768, "thinkingConfig": {"thinkingLevel": "medium"}})
         self.assertNotIn("tools", p)
 
+    def test_default_mode_is_auto_and_audience_in_payload(self):
+        args = r.make_parser().parse_args(["rewrite", "--input", "a", "--output", "b", "--audience", "中学生"])
+        self.assertEqual(args.mode, "auto")
+        p, _ = r.build_payload("元の文章です。", "自然に", "", [], args.mode, "low", 100, args.audience)
+        task = json.loads(p["contents"][0]["parts"][0]["text"])
+        self.assertEqual(task["audience"], "中学生")
+        self.assertIn("一読で理解", task["audience_instruction"])
+        self.assertIsInstance(task["source_diagnostics_hints"], list)
+
+    def test_text_metrics_detects_uniform_rhythm(self):
+        uniform = "これは十文字ほどの文です。" * 8
+        varied = "短い。" + "これはかなり長く続く文で、読点を挟みながら説明を重ねていくものです。" + "確認事項。" + "普通の文です。" * 3
+        u, v = r.text_metrics(uniform), r.text_metrics(varied)
+        self.assertEqual(u["sentence_length_cv"], 0.0)
+        self.assertGreater(v["sentence_length_cv"], 0.5)
+        self.assertEqual(u["taigendome_ratio"], 0.0)
+        self.assertGreater(v["taigendome_ratio"], 0)
+        self.assertIn("文の長さが均質", " ".join(r.diagnostics_hints(u)))
+
+    def test_text_metrics_ignores_code_and_urls(self):
+        m = r.text_metrics("説明です。\n```\nx = 1\n```\n参照 https://example.com/a?b=1 です。")
+        self.assertEqual(m["sentences"], 2)
+
+    def test_more_uniform_output_warns(self):
+        src = "短い。" + "これはかなり長く続く文で、読点を挟みながら説明を重ねていくものです。" * 2 + "確認事項。" + "普通の文です。" * 3
+        out = "これは十文字ほどの文です。" * 7
+        self.assertTrue(any("均質" in w for w in r.inspect_rewrite(src, out, [])["warnings"]))
+
     def test_default_thinking_is_low(self):
         args = r.make_parser().parse_args(["rewrite", "--input", "a", "--output", "b"])
         self.assertEqual(args.thinking, "low")
@@ -94,6 +122,11 @@ class RewriteTests(unittest.TestCase):
         report = r.inspect_rewrite("データは国内で管理します。", "データは国内で厳重に管理します。", [])
         self.assertEqual(report["evaluative_terms_added"], {"厳重": 1})
         self.assertTrue(any("評価語" in w for w in report["warnings"]))
+
+    def test_new_katakana_term_warns(self):
+        report = r.inspect_rewrite("利用状況を確認できます。", "利用状況をダッシュボードで確認できます。", [])
+        self.assertEqual(report["new_katakana_terms"], ["ダッシュボード"])
+        self.assertTrue(any("カタカナ" in w for w in report["warnings"]))
 
     def test_evaluative_terms_in_source_not_flagged(self):
         report = r.inspect_rewrite("安全に管理します。", "安全に管理いたします。", [])

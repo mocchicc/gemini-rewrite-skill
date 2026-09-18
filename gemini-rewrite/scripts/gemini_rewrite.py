@@ -33,6 +33,7 @@ SKILL_ROOT = Path(__file__).resolve().parents[1]
 MAX_BYTES = 300_000  # Local cost guard, NOT the model's context limit.
 MAX_RESPONSE_BYTES = 12_000_000
 MODES = {
+    "auto": "おまかせ。情報を削らず、人が書いたような自然な日本語にする。AIらしい均質さを崩す: 似た長さの文を続けない、段落ごとに同じ文数で刻まない、体言止めや短い一文を適度に混ぜる、「〜ではなく〜」の対比構文を繰り返さない、定型的なAI表現を使わない。読み手が一読で分かる語彙にし、専門用語や抽象語には言い換えや具体を添える。",
     "light": "誤字・不自然な助詞・読点・読みにくい箇所だけを最小限直す。語り口と構成を維持する。",
     "natural": "情報を削らず、自然で読みやすい日本語にする。過剰な丁寧語や定型的なAI表現を避ける。",
     "business": "社外の読み手に伝わる、明瞭で落ち着いた文章にする。過剰な敬語、謝罪、約束を追加しない。",
@@ -142,6 +143,57 @@ def code_blocks(text: str) -> list[str]:
     return blocks
 
 
+def text_metrics(text: str) -> dict[str, Any]:
+    """AI臭の簡易lint。文長の均質さ・段落の文数の均質さ・体言止め・対比構文を数える。
+    判定はしない（疑いの提示のみ）。閾値はコーパス検証していない参考値。"""
+    for block in code_blocks(text):  # コードブロックの中身は文として数えない
+        text = text.replace(block, "")
+    body = "\n".join(line for line in text.splitlines() if not re.match(r"^\s*(#|\||-|\*|\d+\.|```|~~~)", line))
+    body = re.sub(r"https?://\S+|`[^`\n]+`", "", body)
+    paragraphs = [p for p in re.split(r"\n\s*\n", body) if p.strip()]
+    sentences = [s.strip() for s in re.split(r"(?<=[。！？!?])\s*|\n+", body) if s.strip()]
+    lengths = [len(s) for s in sentences]
+
+    def cv(values: list[int]) -> float | None:
+        if len(values) < 2:
+            return None
+        mean = sum(values) / len(values)
+        if mean == 0:
+            return None
+        var = sum((v - mean) ** 2 for v in values) / len(values)
+        return round((var ** 0.5) / mean, 3)
+
+    para_counts = [len([s for s in re.split(r"(?<=[。！？!?])\s*|\n+", p) if s.strip()]) for p in paragraphs]
+    taigen = sum(1 for s in sentences if re.search(r"[\u4e00-\u9fff\u30a0-\u30ff]。?$", s.rstrip("。！？!?") + ""))
+    contrast = sum(s.count("ではなく") for s in sentences)
+    return {
+        "sentences": len(sentences),
+        "mean_sentence_length": round(sum(lengths) / len(lengths), 1) if lengths else 0,
+        "sentence_length_cv": cv(lengths),  # 低いほど文長が均質（AI臭の疑い）
+        "paragraph_sentence_count_cv": cv(para_counts),  # 低いほど段落の文数が均質
+        "taigendome_ratio": round(taigen / len(sentences), 3) if sentences else 0,
+        "contrast_dewanaku_ratio": round(contrast / len(sentences), 3) if sentences else 0,
+        "abstract_noun_count": len(re.findall(r"[\u4e00-\u9fff]{1,3}(?:性|化|的)(?=[はがをにでのと、。])", body)),
+    }
+
+
+def diagnostics_hints(metrics: dict[str, Any]) -> list[str]:
+    """原稿側の疑いを、Geminiへ渡す短いヒントにする。"""
+    hints = []
+    if metrics["sentences"] >= 6:
+        if metrics["sentence_length_cv"] is not None and metrics["sentence_length_cv"] < 0.35:
+            hints.append("文の長さが均質。短い文と長い文を混ぜて緩急をつける")
+        if metrics["taigendome_ratio"] == 0:
+            hints.append("体言止めがゼロ。適度に混ぜる")
+        if metrics["contrast_dewanaku_ratio"] > 0.05:
+            hints.append("「〜ではなく」の対比構文が多い。別の言い方に散らす")
+        if metrics["mean_sentence_length"] > 55:
+            hints.append("一文が長い。読点の多い文は分ける")
+    if metrics["paragraph_sentence_count_cv"] is not None and metrics["paragraph_sentence_count_cv"] < 0.2 and metrics["sentences"] >= 9:
+        hints.append("段落ごとの文数が揃いすぎ。段落の長さを変える")
+    return hints
+
+
 def protected_literals(source: str, keep: list[str]) -> list[str]:
     for item in keep:
         if not item or item not in source:
@@ -153,13 +205,16 @@ def protected_literals(source: str, keep: list[str]) -> list[str]:
 
 
 def build_payload(source: str, brief: str, style: str, keep: list[str], mode: str,
-                  thinking: str, max_output_tokens: int) -> tuple[dict[str, Any], list[str]]:
+                  thinking: str, max_output_tokens: int, audience: str = "") -> tuple[dict[str, Any], list[str]]:
     system = read_text(SKILL_ROOT / "references" / "rewrite-system.md")
     locks = protected_literals(source, keep)
     task = {
         "task": "Rewrite source_text. Return only the complete rewritten text.",
         "mode": mode,
         "mode_instruction": MODES[mode],
+        "audience": audience,
+        "audience_instruction": ("この読み手が一読で理解できる語彙と文の長さにする。専門用語は初出で言い換え、抽象語には具体を添える。情報は省略しない。" if audience else ""),
+        "source_diagnostics_hints": diagnostics_hints(text_metrics(source)),
         "editing_brief": brief,
         "style_reference_not_factual_source": style,
         "verbatim_locks": locks,
@@ -288,12 +343,25 @@ def inspect_rewrite(source: str, rewritten: str, locks: list[str]) -> dict[str, 
     added_terms = {t: rewritten.count(t) - source.count(t) for t in EVALUATIVE_TERMS if rewritten.count(t) > source.count(t)}
     if added_terms:
         warnings.append("原文に無い評価語・程度表現が追加されています: " + "、".join(f"{t}(+{n})" for t, n in added_terms.items()) + "。主張の強さが変わっていないか確認してください。")
+    # 原文に無いカタカナ語（機能名・用語の勝手な追加を拾う。言い換えでも出るので疑いの提示）
+    katakana = r"[\u30a1-\u30fa\u30fc]{2,}"
+    new_katakana = sorted(set(re.findall(katakana, rewritten)) - set(re.findall(katakana, source)))
+    if new_katakana:
+        warnings.append("原文に無いカタカナ語が追加されています: " + "、".join(new_katakana) + "。事実や機能の追加になっていないか確認してください。")
+    before, after = text_metrics(source), text_metrics(rewritten)
+    if (before["sentences"] >= 6 and after["sentences"] >= 6
+            and before["sentence_length_cv"] is not None and after["sentence_length_cv"] is not None):
+        if after["sentence_length_cv"] < before["sentence_length_cv"] * 0.8:
+            warnings.append("出力の文長が原文より均質になっています（AI臭が増えた疑い）。readability を確認してください。")
     return {
         "verbatim_check": "passed", "protected_literal_count": len(locks),
+        "readability": {"source": before, "output": after,
+                        "note": "簡易lint。sentence_length_cv と paragraph_sentence_count_cv は高いほど人間らしい緩急。閾値は未検証の参考値。"},
         "source_characters": len(source), "output_characters": len(rewritten),
         "length_ratio": round(ratio, 4),
         "numeric_literals_missing": missing, "numeric_literals_added": added,
         "evaluative_terms_added": added_terms,
+        "new_katakana_terms": new_katakana,
         "warnings": warnings,
         "semantic_review_required": True,
         "limitation": "機械検査は意味・事実・ニュアンスの保持を保証しません。呼び出し元が原文と差分を確認してください。",
@@ -385,7 +453,7 @@ def run_rewrite(args: argparse.Namespace) -> dict[str, Any]:
     if not re.fullmatch(r"gemini-[a-zA-Z0-9.-]+", model):
         raise RewriteError("モデルIDの形式が不正です。")
     print(f"モデル: {model}（設定元: {model_source}）", file=sys.stderr)
-    payload, locks = build_payload(source, brief, style, keep, args.mode, args.thinking, args.max_output_tokens)
+    payload, locks = build_payload(source, brief, style, keep, args.mode, args.thinking, args.max_output_tokens, args.audience or "")
     if args.dry_run:
         return {"api_called": False, "model_requested": model, "mode": args.mode,
                 "thinking": args.thinking, "request_bytes": len(json.dumps(payload, ensure_ascii=False).encode("utf-8")),
@@ -429,7 +497,8 @@ def make_parser() -> argparse.ArgumentParser:
     brief.add_argument("--brief-file", type=Path)
     rewrite.add_argument("--style-file", type=Path)
     rewrite.add_argument("--keep-file", type=Path)
-    rewrite.add_argument("--mode", choices=tuple(MODES), default="natural")
+    rewrite.add_argument("--mode", choices=tuple(MODES), default="auto", help="既定auto（おまかせ）")
+    rewrite.add_argument("--audience", help="読み手（例: 教育委員会の担当者、中学生）。語彙と文の長さの基準になる")
     rewrite.add_argument("--thinking", choices=("low", "medium", "high"), default="low",
                          help="既定low。構成変更を伴う編集だけmedium以上を明示")
     rewrite.add_argument("--model", help="既定はgemini-3.8-flash。モデル変更はユーザー明示時だけ")
