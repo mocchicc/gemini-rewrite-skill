@@ -46,23 +46,59 @@ class RewriteTests(unittest.TestCase):
         self.assertIsInstance(task["source_diagnostics_hints"], list)
 
     def test_text_metrics_detects_uniform_rhythm(self):
-        uniform = "これは十文字ほどの文です。" * 8
-        varied = "短い。" + "これはかなり長く続く文で、読点を挟みながら説明を重ねていくものです。" + "確認事項。" + "普通の文です。" * 3
+        uniform = ("これは二十文字ほどの文で内容があります。" * 5 + "\n\n") * 5
+        varied = "\n\n".join(["短い。" + "これはかなり長く続く文で、読点を挟みながら説明を重ねていくものです。" + "確認事項。",
+                             "普通の文です。" * 2 + "ここは少しだけ長めにして、リズムを変えるための一文を入れておく。",
+                             "一言。" + "そしてまた長い文が来て、読み手の呼吸を意識した緩急を作り出すことを狙っている。" * 2 + "普通の文です。" * 3] * 3)
         u, v = r.text_metrics(uniform), r.text_metrics(varied)
+        self.assertGreaterEqual(u["chars"], r.MIN_CHARS_RHYTHM)
         self.assertEqual(u["sentence_length_cv"], 0.0)
-        self.assertGreater(v["sentence_length_cv"], 0.5)
+        self.assertLess(u["burstiness"], -0.24)
+        self.assertGreater(u["ending_top2_ratio"], 0.8)
         self.assertEqual(u["taigendome_ratio"], 0.0)
+        self.assertGreater(v["sentence_length_cv"], 0.5)
+        self.assertGreater(v["burstiness"], -0.24)
         self.assertGreater(v["taigendome_ratio"], 0)
-        self.assertIn("文の長さが均質", " ".join(r.diagnostics_hints(u)))
+        hints = " ".join(r.diagnostics_hints(u))
+        self.assertIn("文の長さが均質", hints); self.assertIn("語尾が単調", hints)
 
-    def test_text_metrics_ignores_code_and_urls(self):
-        m = r.text_metrics("説明です。\n```\nx = 1\n```\n参照 https://example.com/a?b=1 です。")
-        self.assertEqual(m["sentences"], 2)
+    def test_text_metrics_min_length_guards(self):
+        self.assertNotIn("sentences", r.text_metrics("短い文。"))
+        mid = "これは二十文字ほどの文で内容があります。" * 10  # 200字
+        m = r.text_metrics(mid)
+        self.assertIn("sentences", m); self.assertNotIn("burstiness", m)
+
+    def test_text_metrics_ignores_code_urls_tables(self):
+        m = r.text_metrics(("説明の文です。" * 20) + "\n```\nx = 1\n```\n参照 https://example.com/a?b=1 です。\n日付\t出来事\n7/21\t閣議決定。")
+        self.assertEqual(m["sentences"], 21)
 
     def test_more_uniform_output_warns(self):
-        src = "短い。" + "これはかなり長く続く文で、読点を挟みながら説明を重ねていくものです。" * 2 + "確認事項。" + "普通の文です。" * 3
-        out = "これは十文字ほどの文です。" * 7
-        self.assertTrue(any("均質" in w for w in r.inspect_rewrite(src, out, [])["warnings"]))
+        src = "\n\n".join(["短い。" + "これはかなり長く続く文で、読点を挟みながら説明を重ねていくものです。" * 2 + "確認事項。" + "普通の文です。" * 3] * 6)
+        out = ("これは十文字ほどの文です。" * 6 + "\n\n") * 6
+        report = r.inspect_rewrite(src, out, [])
+        codes = {f["code"] for f in report["findings"]}
+        self.assertIn("more_uniform", codes); self.assertIn("low_burstiness", codes)
+        self.assertTrue(any("均質" in w for w in report["warnings"]))
+
+    def test_structure_added_warns(self):
+        src = "説明です。" * 30
+        out = "**重要**: 説明です。\n\n1. 一つ目\n2. 二つ目\n\n手順は次の通りです：\n" + "説明です。" * 28
+        codes = {f["code"] for f in r.inspect_rewrite(src, out, [])["findings"]}
+        self.assertTrue({"structure_bold_added", "structure_numbered_lines_added", "structure_predicate_colon_lines_added"} <= codes)
+
+    def test_stock_phrase_single_is_info_cluster_is_warn(self):
+        src = "費用は変わりません。" * 30
+        single = "結論から申し上げますと、費用は変わりません。" + "費用は変わりません。" * 29
+        f = r.stock_phrase_findings(src, single)
+        self.assertEqual((f[0]["level"], f[0]["code"]), ("info", "stock_phrases_added"))
+        cluster = "結論から申し上げますと、費用は変わりません。重要なのは次の点です。" + "費用は変わりません。" * 29
+        self.assertEqual(r.stock_phrase_findings(src, cluster)[0]["level"], "warn")
+        self.assertEqual(r.stock_phrase_findings(single, single), [])  # 原文にあれば増加扱いしない
+
+    def test_findings_levels_and_warnings_consistency(self):
+        report = r.inspect_rewrite("文章です。" * 30, "文章です。", [])
+        self.assertTrue(any(f["level"] == "critical" and f["code"] == "too_short" for f in report["findings"]))
+        self.assertEqual(report["warnings"], [f["message"] for f in report["findings"] if f["level"] != "info"])
 
     def test_default_thinking_is_low(self):
         args = r.make_parser().parse_args(["rewrite", "--input", "a", "--output", "b"])
@@ -127,6 +163,10 @@ class RewriteTests(unittest.TestCase):
         report = r.inspect_rewrite("利用状況を確認できます。", "利用状況をダッシュボードで確認できます。", [])
         self.assertEqual(report["new_katakana_terms"], ["ダッシュボード"])
         self.assertTrue(any("カタカナ" in w for w in report["warnings"]))
+
+    def test_katakana_substring_of_source_not_flagged(self):
+        report = r.inspect_rewrite("アプリインストールは不要です。", "アプリのインストールは不要です。", [])
+        self.assertEqual(report["new_katakana_terms"], [])
 
     def test_evaluative_terms_in_source_not_flagged(self):
         report = r.inspect_rewrite("安全に管理します。", "安全に管理いたします。", [])

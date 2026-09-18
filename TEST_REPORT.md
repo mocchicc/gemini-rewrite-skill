@@ -28,8 +28,15 @@
 - 実原稿4件（プレスリリース草案、社内状況報告、政策メモ）で `business` / `natural` を実行。数値・URL・人名・タブ区切り表は全件保持。一方、4回中3回で原文に無い「安全に」「厳重に」「にとどまる」が追加されており、これを `evaluative_terms_added` 警告として検出できることを実APIで確認した。
 - `--thinking low`（新既定）でも文体調整の品質は変わらず、thoughts トークンは0になった。
 
+## 追記：2026-09-18 AI臭 lint 第1弾
+
+結果：**62 tests / OK**
+
+- リズム指標（burstiness・隣接文長相関・語尾トップ2・同一語尾連続）、最小文字数ガード、Markdown構造の差分、リライト側定型表現の差分（単発 info / 同一段落複数 warn）、findings のレベル分けを追加。
+- 実API（auto、audience 指定、AI が書いたプレスリリース草案 1,966 字）: 同一語尾の最大連続 12 → 6、平均文長 58 → 55 と改善した一方、burstiness は −0.27 → −0.33 と均質寄りに動いた。auto モードのリズム改善効果は限定的で、`rhythm_not_improved` を info で出すようにした。評価語（厳重・手軽）とカタカナ語（ケース・サーバー・パターン）の追加は今回も検出。
+
 ## 未検証
 
-長文原稿・`business` / `social` モードでのリライト品質。実Codex / Claude Codeからの `$gemini-rewrite` / `/gemini-rewrite` 呼び出し。Windowsは想定対象外。
+lint 閾値の人間コーパスでの妥当性（coji/natural-japanese の値を借用）。長文原稿・`business` / `social` モードでのリライト品質。実Codex / Claude Codeからの `$gemini-rewrite` / `/gemini-rewrite` 呼び出し。Windowsは想定対象外。
 
 API応答を置換したモックテストは、実際にGeminiが文章を書き換えたことを示すものではありません。利用前に架空のサンプル原稿で本人の環境における疎通を確認してください。

@@ -143,55 +143,171 @@ def code_blocks(text: str) -> list[str]:
     return blocks
 
 
-def text_metrics(text: str) -> dict[str, Any]:
-    """AI臭の簡易lint。文長の均質さ・段落の文数の均質さ・体言止め・対比構文を数える。
-    判定はしない（疑いの提示のみ）。閾値はコーパス検証していない参考値。"""
-    for block in code_blocks(text):  # コードブロックの中身は文として数えない
+# リライト側モデルが持ち込みやすい定型表現（言語処理学会2026 B9-17 のモデル固有フレーズ表ほか）。
+# 単発は info、同一段落に2種類以上が新たに現れたときだけ warn（Ningenize: 種類数で見る）。
+STOCK_PHRASES = {
+    "結論先出し": r"結論から(申し上げ|言い|いい)ますと",
+    "以下の通り": r"以下の(通り|とおり)(です|になります)",
+    "主な理由": r"主な(理由|ポイント|特徴)は",
+    "意義付け節": r"を(浮き彫りに|示唆し|物語っ)て",
+    "言えるでしょう": r"と(言える|いえる)でしょう",
+    "重要なのは": r"重要なのは",
+    "することで": r"することで[^。]{0,25}(でき|可能)",
+    "だけでなく": r"だけでなく",
+    "画期的な一歩": r"(画期的|大きな|新たな)(一歩|節目)",
+    "期待されます": r"(期待|注目)されます",
+}
+MIN_CHARS_ANY = 100     # これ未満は指標を出さない
+MIN_CHARS_RHYTHM = 400  # これ未満は全文リズム指標を出さない
+SENTENCE_SPLIT = r"(?<=[。！？!?])\s*|\n+"
+
+
+def _split_sentences(text: str) -> list[str]:
+    return [s.strip() for s in re.split(SENTENCE_SPLIT, text) if s.strip()]
+
+
+def _prose_body(text: str) -> str:
+    """見出し・表・箇条書き・コード・URL を除いた地の文。"""
+    for block in code_blocks(text):
         text = text.replace(block, "")
-    body = "\n".join(line for line in text.splitlines() if not re.match(r"^\s*(#|\||-|\*|\d+\.|```|~~~)", line))
-    body = re.sub(r"https?://\S+|`[^`\n]+`", "", body)
-    paragraphs = [p for p in re.split(r"\n\s*\n", body) if p.strip()]
-    sentences = [s.strip() for s in re.split(r"(?<=[。！？!?])\s*|\n+", body) if s.strip()]
-    lengths = [len(s) for s in sentences]
+    body = "\n".join(line for line in text.splitlines()
+                      if not re.match(r"^\s*(#|\||-|\*|\d+[.)]|```|~~~)", line) and "\t" not in line)
+    return re.sub(r"https?://\S+|`[^`\n]+`|\*\*", "", body)
 
-    def cv(values: list[int]) -> float | None:
-        if len(values) < 2:
-            return None
-        mean = sum(values) / len(values)
-        if mean == 0:
-            return None
-        var = sum((v - mean) ** 2 for v in values) / len(values)
-        return round((var ** 0.5) / mean, 3)
 
-    para_counts = [len([s for s in re.split(r"(?<=[。！？!?])\s*|\n+", p) if s.strip()]) for p in paragraphs]
-    taigen = sum(1 for s in sentences if re.search(r"[\u4e00-\u9fff\u30a0-\u30ff]。?$", s.rstrip("。！？!?") + ""))
-    contrast = sum(s.count("ではなく") for s in sentences)
+def _cv(values: list[float]) -> float | None:
+    if len(values) < 2:
+        return None
+    mean = sum(values) / len(values)
+    if mean == 0:
+        return None
+    var = sum((v - mean) ** 2 for v in values) / len(values)
+    return round((var ** 0.5) / mean, 3)
+
+
+def _burstiness(values: list[float]) -> float | None:
+    """(σ−μ)/(σ+μ)。−1 に近いほど均質。人間の随筆は −0.24 より大きいことが多い。"""
+    if len(values) < 2:
+        return None
+    mean = sum(values) / len(values)
+    sigma = (sum((v - mean) ** 2 for v in values) / len(values)) ** 0.5
+    return round((sigma - mean) / (sigma + mean), 3) if (sigma + mean) else None
+
+
+def _lag1_autocorr(values: list[float]) -> float | None:
+    """隣接する文の長さの相関。高いほど「同じ長さが続く」。"""
+    if len(values) < 4:
+        return None
+    mean = sum(values) / len(values)
+    den = sum((v - mean) ** 2 for v in values)
+    if den == 0:
+        return None
+    num = sum((values[i] - mean) * (values[i + 1] - mean) for i in range(len(values) - 1))
+    return round(num / den, 3)
+
+
+def _structure_counts(text: str) -> dict[str, int]:
+    """Markdown 構造の量（原稿と出力の差分で見る）。"""
+    lines = text.splitlines()
     return {
-        "sentences": len(sentences),
-        "mean_sentence_length": round(sum(lengths) / len(lengths), 1) if lengths else 0,
-        "sentence_length_cv": cv(lengths),  # 低いほど文長が均質（AI臭の疑い）
-        "paragraph_sentence_count_cv": cv(para_counts),  # 低いほど段落の文数が均質
-        "taigendome_ratio": round(taigen / len(sentences), 3) if sentences else 0,
-        "contrast_dewanaku_ratio": round(contrast / len(sentences), 3) if sentences else 0,
-        "abstract_noun_count": len(re.findall(r"[\u4e00-\u9fff]{1,3}(?:性|化|的)(?=[はがをにでのと、。])", body)),
+        "bold": len(re.findall(r"\*\*[^*\n]+\*\*", text)),
+        "numbered_lines": sum(1 for l in lines if re.match(r"^\s*\d+[.)]\s", l)),
+        "bullet_lines": sum(1 for l in lines if re.match(r"^\s*[-*・]\s", l)),
+        "predicate_colon_lines": sum(1 for l in lines if re.search(r"(です|ます|する|した|される|できる|あります)[：:]\s*$", l)),
+        "headings": sum(1 for l in lines if re.match(r"^\s*#{1,6}\s", l)),
     }
+
+
+def text_metrics(text: str) -> dict[str, Any]:
+    """AI臭の簡易lint。判定はしない（疑いの提示のみ）。
+    閾値は coji/natural-japanese の人間コーパス検証値を参考にしたが、本Skillでは未検証。"""
+    body = _prose_body(text)
+    chars = len(re.sub(r"\s", "", body))
+    result: dict[str, Any] = {"chars": chars, "structure": _structure_counts(text)}
+    if chars < MIN_CHARS_ANY:
+        result["note"] = f"{MIN_CHARS_ANY}字未満のため指標なし"
+        return result
+    paragraphs = [p for p in re.split(r"\n\s*\n", body) if p.strip()]
+    sentences = _split_sentences(body)
+    lengths = [float(len(s)) for s in sentences]
+    endings = [s.rstrip("。！？!?")[-2:] for s in sentences]
+    top2 = sum(n for _, n in Counter(endings).most_common(2))
+    same_run = max_run = 1
+    for a, b in zip(endings, endings[1:]):
+        same_run = same_run + 1 if a == b else 1
+        max_run = max(max_run, same_run)
+    taigen = sum(1 for s in sentences if re.search(r"[\u4e00-\u9fff\u30a0-\u30ff]$", s.rstrip("。！？!?")))
+    n = len(sentences) or 1
+    result.update({
+        "sentences": len(sentences),
+        "mean_sentence_length": round(sum(lengths) / n, 1),
+        "taigendome_ratio": round(taigen / n, 3),
+        "ending_top2_ratio": round(top2 / n, 3),  # 語尾トップ2の占有率。>0.8 で単調の疑い
+        "max_same_ending_run": max_run,           # 同じ語尾の連続数。3以上で疑い
+        "contrast_dewanaku_ratio": round(sum(s.count("ではなく") for s in sentences) / n, 3),
+        "ten_per_sentence": round(sum(s.count("、") for s in sentences) / n, 2),
+        "abstract_nouns_per_1000": round(len(re.findall(r"[\u4e00-\u9fff]{1,3}(?:性|化|的)(?=[はがをにでのと、。])", body)) * 1000 / chars, 1),
+        "stock_phrase_kinds": sorted(k for k, pat in STOCK_PHRASES.items() if re.search(pat, body)),
+    })
+    if chars < MIN_CHARS_RHYTHM:
+        result["note"] = f"{MIN_CHARS_RHYTHM}字未満のため全文リズム指標なし"
+        return result
+    para_counts = [float(len(_split_sentences(p))) for p in paragraphs]
+    result.update({
+        "sentence_length_cv": _cv(lengths),                 # 高いほど緩急がある
+        "burstiness": _burstiness(lengths),                 # < -0.24 で均質の疑い
+        "lag1_autocorr": _lag1_autocorr(lengths),           # > 0.6 で同じ長さが続く疑い
+        "paragraph_sentence_count_cv": _cv(para_counts),    # < 0.15 で段落が判で押した疑い
+    })
+    return result
 
 
 def diagnostics_hints(metrics: dict[str, Any]) -> list[str]:
     """原稿側の疑いを、Geminiへ渡す短いヒントにする。"""
     hints = []
-    if metrics["sentences"] >= 6:
-        if metrics["sentence_length_cv"] is not None and metrics["sentence_length_cv"] < 0.35:
-            hints.append("文の長さが均質。短い文と長い文を混ぜて緩急をつける")
-        if metrics["taigendome_ratio"] == 0:
-            hints.append("体言止めがゼロ。適度に混ぜる")
-        if metrics["contrast_dewanaku_ratio"] > 0.05:
-            hints.append("「〜ではなく」の対比構文が多い。別の言い方に散らす")
-        if metrics["mean_sentence_length"] > 55:
-            hints.append("一文が長い。読点の多い文は分ける")
-    if metrics["paragraph_sentence_count_cv"] is not None and metrics["paragraph_sentence_count_cv"] < 0.2 and metrics["sentences"] >= 9:
+    if "sentences" not in metrics:
+        return hints
+    m = metrics
+    if m.get("burstiness") is not None and m["burstiness"] < -0.24:
+        hints.append("文の長さが均質。短い文と長い文を混ぜて緩急をつける")
+    elif m.get("sentence_length_cv") is not None and m["sentence_length_cv"] < 0.35:
+        hints.append("文の長さが均質。短い文と長い文を混ぜて緩急をつける")
+    if m.get("lag1_autocorr") is not None and m["lag1_autocorr"] > 0.6:
+        hints.append("似た長さの文が連続している。長短を交互にする")
+    if m["ending_top2_ratio"] > 0.8 or m["max_same_ending_run"] >= 4:
+        hints.append("語尾が単調。同じ語尾を続けない")
+    if m["taigendome_ratio"] == 0 and m["sentences"] >= 10:
+        hints.append("体言止めがゼロ。適度に混ぜる")
+    if m["contrast_dewanaku_ratio"] > 0.05:
+        hints.append("「〜ではなく」の対比構文が多い。別の言い方に散らす")
+    if m["mean_sentence_length"] > 55:
+        hints.append("一文が長い。読点の多い文は分ける")
+    if m.get("paragraph_sentence_count_cv") is not None and m["paragraph_sentence_count_cv"] < 0.15:
         hints.append("段落ごとの文数が揃いすぎ。段落の長さを変える")
+    if len(m["stock_phrase_kinds"]) >= 2:
+        hints.append("定型表現（" + "・".join(m["stock_phrase_kinds"]) + "）が複数ある。言い換えるか削る")
     return hints
+
+
+def stock_phrase_findings(source: str, rewritten: str) -> list[dict[str, str]]:
+    """リライトで新たに増えた定型表現。単発は info、同一段落に2種類以上なら warn。"""
+    findings = []
+    increased = {k for k, pat in STOCK_PHRASES.items()
+                 if len(re.findall(pat, rewritten)) > len(re.findall(pat, source))}
+    if not increased:
+        return findings
+    clustered = False
+    for para in re.split(r"\n\s*\n", rewritten):
+        kinds = {k for k in increased if re.search(STOCK_PHRASES[k], para)}
+        present = {k for k, pat in STOCK_PHRASES.items() if re.search(pat, para)}
+        if kinds and len(present) >= 2:
+            clustered = True
+            break
+    level = "warn" if clustered else "info"
+    findings.append({"level": level, "code": "stock_phrases_added",
+                     "message": "リライトで定型表現が増えています: " + "、".join(sorted(increased))
+                     + ("。同一段落に複数の定型表現が集まっています。" if clustered else "。単発なので参考程度。")})
+    return findings
 
 
 def protected_literals(source: str, keep: list[str]) -> list[str]:
@@ -333,35 +449,55 @@ def inspect_rewrite(source: str, rewritten: str, locks: list[str]) -> dict[str, 
     old, new = Counter(re.findall(pattern, source)), Counter(re.findall(pattern, rewritten))
     missing, added = dict(old - new), dict(new - old)
     ratio = len(rewritten.strip()) / max(len(source.strip()), 1)
-    warnings = []
+    findings: list[dict[str, str]] = []
+
+    def add(level: str, code: str, message: str) -> None:
+        findings.append({"level": level, "code": code, "message": message})
+
     if missing or added:
-        warnings.append("数値の表記・出現数に差があります。日付・金額・割合を原文と照合してください。")
+        add("warn", "numeric_change", "数値の表記・出現数に差があります。日付・金額・割合を原文と照合してください。")
     if ratio < 0.70:
-        warnings.append("文字数が原文の70%未満です。意図しない要約や情報欠落を確認してください。")
+        add("critical", "too_short", "文字数が原文の70%未満です。意図しない要約や情報欠落を確認してください。")
     if ratio > 1.40:
-        warnings.append("文字数が原文の140%超です。事実の追加や冗長化を確認してください。")
+        add("warn", "too_long", "文字数が原文の140%超です。事実の追加や冗長化を確認してください。")
     added_terms = {t: rewritten.count(t) - source.count(t) for t in EVALUATIVE_TERMS if rewritten.count(t) > source.count(t)}
     if added_terms:
-        warnings.append("原文に無い評価語・程度表現が追加されています: " + "、".join(f"{t}(+{n})" for t, n in added_terms.items()) + "。主張の強さが変わっていないか確認してください。")
+        add("warn", "evaluative_terms_added", "原文に無い評価語・程度表現が追加されています: " + "、".join(f"{t}(+{n})" for t, n in added_terms.items()) + "。主張の強さが変わっていないか確認してください。")
     # 原文に無いカタカナ語（機能名・用語の勝手な追加を拾う。言い換えでも出るので疑いの提示）
     katakana = r"[\u30a1-\u30fa\u30fc]{2,}"
-    new_katakana = sorted(set(re.findall(katakana, rewritten)) - set(re.findall(katakana, source)))
+    new_katakana = sorted(k for k in set(re.findall(katakana, rewritten)) if k not in source)
     if new_katakana:
-        warnings.append("原文に無いカタカナ語が追加されています: " + "、".join(new_katakana) + "。事実や機能の追加になっていないか確認してください。")
+        add("warn", "new_katakana_terms", "原文に無いカタカナ語が追加されています: " + "、".join(new_katakana) + "。事実や機能の追加になっていないか確認してください。")
     before, after = text_metrics(source), text_metrics(rewritten)
-    if (before["sentences"] >= 6 and after["sentences"] >= 6
-            and before["sentence_length_cv"] is not None and after["sentence_length_cv"] is not None):
-        if after["sentence_length_cv"] < before["sentence_length_cv"] * 0.8:
-            warnings.append("出力の文長が原文より均質になっています（AI臭が増えた疑い）。readability を確認してください。")
+    b_cv, a_cv = before.get("sentence_length_cv"), after.get("sentence_length_cv")
+    if b_cv is not None and a_cv is not None and a_cv < b_cv * 0.8:
+        add("warn", "more_uniform", "出力の文長が原文より均質になっています（AI臭が増えた疑い）。readability を確認してください。")
+    b_b, a_b = before.get("burstiness"), after.get("burstiness")
+    if a_b is not None and a_b < -0.24 and (b_b is None or b_b >= -0.24):
+        add("warn", "low_burstiness", "出力の文長リズムが均質です（burstiness < -0.24）。")
+    elif a_b is not None and b_b is not None and a_b < b_b - 0.03:
+        add("info", "rhythm_not_improved", f"文長リズムは原文より均質寄りです（burstiness {b_b} → {a_b}）。auto モードの狙いである緩急は付いていません。")
+    if "ending_top2_ratio" in after and after["ending_top2_ratio"] > 0.8 and before.get("ending_top2_ratio", 0) <= 0.8:
+        add("warn", "monotonous_endings", "出力の語尾が単調になっています（トップ2語尾が8割超）。")
+    if "max_same_ending_run" in after and after["max_same_ending_run"] >= 3 and after["max_same_ending_run"] > before.get("max_same_ending_run", 0):
+        add("info", "same_ending_run", f"同じ語尾が{after['max_same_ending_run']}文連続する箇所があります。")
+    for key, label in (("bold", "太字"), ("numbered_lines", "番号付き箇条書き"), ("bullet_lines", "箇条書き"),
+                       ("predicate_colon_lines", "述語で終わるコロン行"), ("headings", "見出し")):
+        b, a = before["structure"][key], after["structure"][key]
+        if a > b:
+            add("warn", f"structure_{key}_added", f"リライトで{label}が増えています（{b}→{a}）。原文に無い構造の追加です。")
+    findings.extend(stock_phrase_findings(source, rewritten))
+    warnings = [f["message"] for f in findings if f["level"] in ("warn", "critical")]
     return {
         "verbatim_check": "passed", "protected_literal_count": len(locks),
         "readability": {"source": before, "output": after,
-                        "note": "簡易lint。sentence_length_cv と paragraph_sentence_count_cv は高いほど人間らしい緩急。閾値は未検証の参考値。"},
+                        "note": "簡易lint。burstiness > -0.24、lag1_autocorr < 0.6、ending_top2_ratio < 0.8 が人間の随筆に多い帯。閾値は coji/natural-japanese を参考にしたが本Skillでは未検証。"},
         "source_characters": len(source), "output_characters": len(rewritten),
         "length_ratio": round(ratio, 4),
         "numeric_literals_missing": missing, "numeric_literals_added": added,
         "evaluative_terms_added": added_terms,
         "new_katakana_terms": new_katakana,
+        "findings": findings,
         "warnings": warnings,
         "semantic_review_required": True,
         "limitation": "機械検査は意味・事実・ニュアンスの保持を保証しません。呼び出し元が原文と差分を確認してください。",
