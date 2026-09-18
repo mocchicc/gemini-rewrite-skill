@@ -91,6 +91,8 @@ python3 ~/.agents/skills/gemini-rewrite/scripts/gemini_rewrite.py configure
 python3 ~/.agents/skills/gemini-rewrite/scripts/gemini_rewrite.py check
 ```
 
+`check` はローカル設定の確認だけです。出力の `connectivity` / `model_access` は `not_checked` のままで、キーの有効性や疎通は最初の `rewrite` 実行で初めて分かります。
+
 ## 4. 呼び出す
 
 ### Codex
@@ -144,8 +146,10 @@ draft.rewritten.md.diff
 ├─ 原文との差分
 
 draft.rewritten.md.report.json
-└─ 使用モデル、トークン情報、数値変更などの警告
+└─ 使用モデル、トークン情報、数値変更・評価語追加などの警告
 ```
+
+失敗したときは本文を保存せず、代わりに `draft.rewritten.md.failure.json` にエラー分類（`dns` / `tls` / `refused` / `timeout` / `http` など）と HTTP 状態、経過秒だけを残します。原稿・API キー・応答本文は含みません。Google 側で処理・課金されたかは判定できないため `billing_status` は常に `unknown` です。
 
 **元原稿は自動では上書きしません。**
 
@@ -184,8 +188,10 @@ python3 gemini-rewrite/scripts/gemini_rewrite.py rewrite \
   --brief-file examples/brief.txt \
   --keep-file examples/keep.json \
   --mode natural \
-  --thinking medium
+  --thinking low
 ```
+
+`--thinking` の既定は `low` です。構成変更を伴う編集だけ `medium` を指定してください。`--keep-file` の文字列にはタブや改行を含めないでください。
 
 ## 自分の文体を参考にさせる
 

@@ -58,7 +58,7 @@ python3 ~/.agents/skills/gemini-rewrite/scripts/gemini_rewrite.py configure
 
 環境変数 `GEMINI_API_KEY` を本人の環境ですでに設定している場合は、そちらを優先します。このスクリプトは `GOOGLE_API_KEY` や他のプロジェクトの `.env` を自動探索しません。GUIアプリの起動方法で環境変数が渡らない場合も、上記の設定ファイルをスクリプトから読み取れます。
 
-設定確認は以下です。**checkが成功しても、APIキーの有効性・モデル権限・通信の疎通は未確認です。**
+設定確認は以下です。**checkが成功しても、APIキーの有効性・モデル権限・通信の疎通は未確認です。** 出力では `local_config: passed` と、`api_key_valid` / `connectivity` / `model_access` の `not_checked` を分けて表示します。
 
 ```bash
 python3 ~/.agents/skills/gemini-rewrite/scripts/gemini_rewrite.py check
@@ -143,9 +143,9 @@ draft.rewritten.md.report.json   指定／応答モデル、利用トークン�
 
 ### パラメータ
 
-`--brief-file` は編集指示を保存したUTF-8テキスト、`--style-file` は任意の文体例、`--keep-file` は厳密維持する文字列のJSON配列です。短い固定の指示には `--brief` も利用できます。ユーザーから来た長文をシェルコマンドへ直接埋め込まず、ファイルで渡す運用を推奨します。
+`--brief-file` は編集指示を保存したUTF-8テキスト、`--style-file` は任意の文体例、`--keep-file` は厳密維持する文字列のJSON配列です（文字列にタブ・改行は含められません）。短い固定の指示には `--brief` も利用できます。ユーザーから来た長文をシェルコマンドへ直接埋め込まず、ファイルで渡す運用を推奨します。
 
-モデルは `--model`、または `GEMINI_REWRITE_MODEL` で明示的に変更できます。未指定時は `gemini-3.8-flash`。推論設定は `low / medium / high` のみ、既定 `medium`。`minimal` は指定できません。現在の3.8向けガイドに合わせ、`temperature / topP / topK / candidateCount / thinkingBudget` は送信しません。
+モデルは `--model`、または `GEMINI_REWRITE_MODEL` で明示的に変更できます。未指定時は `gemini-3.8-flash`。推論設定は `low / medium / high` のみ、既定 `low`（構成変更を伴う編集だけ `medium` 以上を明示）。`minimal` は指定できません。現在の3.8向けガイドに合わせ、`temperature / topP / topK / candidateCount / thinkingBudget` は送信しません。
 
 `--max-output-tokens` は既定32768、設定範囲1〜65536です。完了理由が `STOP` でない出力は保存しません。出力上限に達したとき、続きを推測して補完したり、別モデルへ切り替えたりはしません。
 
@@ -153,11 +153,13 @@ draft.rewritten.md.report.json   指定／応答モデル、利用トークン�
 
 `--timeout` は通信の待機上限（既定180秒）。これは完了時間の予告や厳密な総実行時間上限ではありません。既定では再試行しません。`--retries 1`などを明示した場合だけ429 / 503の一部を再試行します。通信切断・タイムアウトは課金の重複を避けるため自動再試行しません。
 
+通信に失敗したときは `<出力先>.failure.json` に、エラー分類（`dns` / `tls` / `refused` / `connection` / `timeout` / `http` / `blocked` / `not_stop` / `verbatim_lock`）、HTTP状態、経過秒を残します。原稿・APIキー・API応答本文は含めません。Google側で処理・課金されたかはスクリプトからは判定できないため、`billing_status` は常に `unknown` です。分類が `dns` / `refused` / `tls` の場合は、実行環境の通信制限や設定の問題なので、その環境の正規の権限申請手順で許可を得てから再実行してください。
+
 ## 7. 何を守り、何を保証しないか
 
 URL、通常のインラインコード、数値の引用マーカー、フェンス形式のコードブロック、`keep-file`で指定した文字列は簡易抽出し、原文と同じ文字列・出現回数かを検査します。不一致時は本文を保存しません。Markdownの完全な構文解析器ではないため、特殊な書式では検知が限定的です。
 
-一般の数値は差を警告しますが、検出だけで自動修正しません。文字数が原文の70%未満または140%超の場合も警告します。この閾値は便利な注意喚起であり、品質評価の基準や意味保持の保証ではありません。
+一般の数値は差を警告しますが、検出だけで自動修正しません。原文に無い評価語・程度表現（「安全に」「厳重に」「にとどまる」など）が追加された場合も `evaluative_terms_added` として警告します。主張の強さが変わる典型例なので、対外文書では原文に戻すか不採用にしてください。文字数が原文の70%未満または140%超の場合も警告します。この閾値は便利な注意喚起であり、品質評価の基準や意味保持の保証ではありません。
 
 固有名詞の全件自動抽出、否定の反転、条件や例外の脱落、文章全体の事実検証まではプログラムで保証できません。**その確認は呼び出し元に残します。** ただし、せっかくGeminiが整えた文章をまた全面的に書き換えないよう、Skillで役割を分けています。
 

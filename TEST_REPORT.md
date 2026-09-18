@@ -20,6 +20,14 @@
 - 小文字の `thinkingLevel`（`"medium"`）でAPIが受理されることを確認。
 - 参考：この短い原稿で `thoughtsTokenCount` 929 / 本文出力 110 トークン。短文では `--thinking low` で十分な可能性がある。
 
+## 追記：2026-09-18 改良後の検証
+
+結果：**52 tests / OK**（通信エラー分類 dns / tls / refused / timeout、HTTP状態の保持、失敗レポートに原稿・キーを含めないこと、評価語追加の警告、keep-file不正JSONの案内、モデル設定元の判定を追加）
+
+- Claude Code から `/gemini-rewrite` の呼び出しを確認（Skill が読み込まれ、`check` → `rewrite` の手順どおりに動作）。
+- 実原稿4件（プレスリリース草案、社内状況報告、政策メモ）で `business` / `natural` を実行。数値・URL・人名・タブ区切り表は全件保持。一方、4回中3回で原文に無い「安全に」「厳重に」「にとどまる」が追加されており、これを `evaluative_terms_added` 警告として検出できることを実APIで確認した。
+- `--thinking low`（新既定）でも文体調整の品質は変わらず、thoughts トークンは0になった。
+
 ## 未検証
 
 長文原稿・`business` / `social` モードでのリライト品質。実Codex / Claude Codeからの `$gemini-rewrite` / `/gemini-rewrite` 呼び出し。Windowsは想定対象外。

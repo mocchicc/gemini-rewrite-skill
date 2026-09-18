@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import ssl
 import stat
 import sys
 import tempfile
@@ -41,6 +42,16 @@ MODES = {
 
 class RewriteError(Exception):
     """An actionable error safe to display without exposing API response bodies."""
+
+    def __init__(self, message: str, *, category: str = "error", http_status: int | None = None):
+        super().__init__(message)
+        self.category = category  # 失敗レポート用の分類（原稿・キー・応答本文は含めない）
+        self.http_status = http_status
+
+
+# 原文に無いのに追加されやすい評価語・程度表現。検出は警告のみで自動修正しない。
+EVALUATIVE_TERMS = ("安全", "安心", "厳重", "確実", "万全", "徹底", "強力", "大幅", "画期的",
+                    "にとどまる", "にすぎない", "しっかり", "手軽", "簡単")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -206,18 +217,40 @@ def request_gemini(payload: dict[str, Any], key: str, model: str, timeout: float
                 429: "割り当て・レート制限・課金設定を確認してください。",
                 503: "サービスが一時的に利用できません。自動的な別モデルへの切り替えは行いません。",
             }
-            raise RewriteError(f"Gemini API HTTP {code}。{hints.get(code, 'API通信が失敗しました。')} 出力は保存していません。") from None
-        except (urllib.error.URLError, socket.timeout, TimeoutError):
-            raise RewriteError("API通信が失敗またはタイムアウトしました。課金済みの可能性があるため通信エラーは自動再試行しません。") from None
+            raise RewriteError(f"Gemini API HTTP {code}。{hints.get(code, 'API通信が失敗しました。')} 出力は保存していません。",
+                               category="http", http_status=code) from None
+        except (urllib.error.URLError, OSError) as exc:
+            category, hint = classify_network_error(exc)
+            raise RewriteError(
+                f"API通信に失敗しました（分類: {category}）。{hint} "
+                "Google側で処理・課金されたかは不明です。通信エラーは自動再試行しません。"
+                "通信制限のある環境では、正規の権限申請手順で許可を得てから再実行してください。",
+                category=category) from None
         except (json.JSONDecodeError, UnicodeDecodeError):
-            raise RewriteError("API応答をJSONとして読み取れません。出力は保存していません。") from None
-    raise RewriteError("API呼び出しが完了しませんでした。")
+            raise RewriteError("API応答をJSONとして読み取れません。出力は保存していません。", category="bad_response") from None
+    raise RewriteError("API呼び出しが完了しませんでした。", category="incomplete")
+
+
+def classify_network_error(exc: BaseException) -> tuple[str, str]:
+    """通信例外を、原稿・キー・本文を含まない分類名と対処ヒントに変換する。"""
+    reason = getattr(exc, "reason", exc)
+    if isinstance(reason, (socket.timeout, TimeoutError)) or isinstance(exc, (socket.timeout, TimeoutError)):
+        return "timeout", "応答待ちが上限を超えました。--timeout の延長は本人が判断してください。"
+    if isinstance(reason, socket.gaierror):
+        return "dns", "ホスト名を解決できません。ネットワーク接続やサンドボックスの通信制限を確認してください。"
+    if isinstance(reason, ssl.SSLError):
+        return "tls", "TLS証明書の検証に失敗しました。プロキシや証明書設定を確認してください。"
+    if isinstance(reason, ConnectionRefusedError):
+        return "refused", "接続が拒否されました。プロキシやファイアウォール設定を確認してください。"
+    if isinstance(reason, ConnectionError):
+        return "connection", "接続が切断されました。"
+    return "network", "分類できない通信エラーです。"
 
 
 def extract_text(data: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     feedback = data.get("promptFeedback") or {}
     if feedback.get("blockReason"):
-        raise RewriteError("入力がAPIでブロックされました。別モデルへの迂回や本文保存は行いません。")
+        raise RewriteError("入力がAPIでブロックされました。別モデルへの迂回や本文保存は行いません。", category="blocked")
     candidates = data.get("candidates")
     if not isinstance(candidates, list) or not candidates or not isinstance(candidates[0], dict):
         raise RewriteError("APIから本文が返されませんでした。")
@@ -225,7 +258,7 @@ def extract_text(data: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     reason = candidate.get("finishReason")
     if reason != "STOP":
         label = reason if isinstance(reason, str) and re.fullmatch(r"[A-Z_]+", reason) else "UNKNOWN"
-        raise RewriteError(f"生成が正常完了していません (finishReason={label})。途中の本文は保存しません。")
+        raise RewriteError(f"生成が正常完了していません (finishReason={label})。途中の本文は保存しません。", category="not_stop")
     parts = (candidate.get("content") or {}).get("parts") or []
     text = "".join(p["text"] for p in parts
                    if isinstance(p, dict) and not p.get("thought") and isinstance(p.get("text"), str))
@@ -240,7 +273,7 @@ def inspect_rewrite(source: str, rewritten: str, locks: list[str]) -> dict[str, 
     failed = [item for item in locks if rewritten.count(item) != source.count(item)]
     if failed:
         # Do not expose potentially sensitive locked text on stderr.
-        raise RewriteError(f"保護対象の文字列・URL・コード等で {len(failed)} 件の改変／欠落／重複を検出しました。本文は保存しません。")
+        raise RewriteError(f"保護対象の文字列・URL・コード等で {len(failed)} 件の改変／欠落／重複を検出しました。本文は保存しません。", category="verbatim_lock")
     pattern = r"(?<![A-Za-z0-9])[0-9０-９]+(?:[.,．，][0-9０-９]+)*"
     old, new = Counter(re.findall(pattern, source)), Counter(re.findall(pattern, rewritten))
     missing, added = dict(old - new), dict(new - old)
@@ -252,15 +285,47 @@ def inspect_rewrite(source: str, rewritten: str, locks: list[str]) -> dict[str, 
         warnings.append("文字数が原文の70%未満です。意図しない要約や情報欠落を確認してください。")
     if ratio > 1.40:
         warnings.append("文字数が原文の140%超です。事実の追加や冗長化を確認してください。")
+    added_terms = {t: rewritten.count(t) - source.count(t) for t in EVALUATIVE_TERMS if rewritten.count(t) > source.count(t)}
+    if added_terms:
+        warnings.append("原文に無い評価語・程度表現が追加されています: " + "、".join(f"{t}(+{n})" for t, n in added_terms.items()) + "。主張の強さが変わっていないか確認してください。")
     return {
         "verbatim_check": "passed", "protected_literal_count": len(locks),
         "source_characters": len(source), "output_characters": len(rewritten),
         "length_ratio": round(ratio, 4),
         "numeric_literals_missing": missing, "numeric_literals_added": added,
+        "evaluative_terms_added": added_terms,
         "warnings": warnings,
         "semantic_review_required": True,
         "limitation": "機械検査は意味・事実・ニュアンスの保持を保証しません。呼び出し元が原文と差分を確認してください。",
     }
+
+
+def resolve_model(cli_model: str | None) -> tuple[str, str]:
+    """適用するモデルIDと、その設定元（--model / 環境変数 / 既定）を返す。"""
+    if cli_model:
+        return cli_model, "--model"
+    env = os.environ.get("GEMINI_REWRITE_MODEL", "").strip()
+    if env:
+        return env, "環境変数 GEMINI_REWRITE_MODEL"
+    return DEFAULT_MODEL, "既定値"
+
+
+def write_failure_report(output: Path, model: str, mode: str, thinking: str,
+                         started: float, exc: RewriteError) -> Path | None:
+    """失敗時の診断を残す。原稿・キー・API応答本文は含めない。既存ファイルは上書きしない。"""
+    path = Path(str(output) + ".failure.json")
+    if os.path.lexists(path) or not path.parent.is_dir():
+        return None
+    report = {"created_at": datetime.now(timezone.utc).isoformat(), "api_called": True, "succeeded": False,
+              "model_requested": model, "mode": mode, "thinking": thinking,
+              "elapsed_seconds": round(time.monotonic() - started, 1),
+              "error_category": exc.category, "http_status": exc.http_status, "message": str(exc),
+              "billing_status": "unknown"}
+    try:
+        publish_files({path: json.dumps(report, ensure_ascii=False, indent=2) + "\n"})
+    except OSError:
+        return None
+    return path
 
 
 def output_paths(output: Path) -> list[Path]:
@@ -307,25 +372,36 @@ def run_rewrite(args: argparse.Namespace) -> dict[str, Any]:
         style = read_text(args.style_file)
         inputs.append(args.style_file)
     if args.keep_file:
-        keep = json.loads(read_text(args.keep_file))
+        try:
+            keep = json.loads(read_text(args.keep_file))
+        except json.JSONDecodeError as exc:
+            raise RewriteError("keep-file のJSONが不正です。文字列にタブや改行を含めず、[\"語1\", \"語2\"] の形式にしてください。") from exc
         if not isinstance(keep, list) or not all(isinstance(x, str) for x in keep):
             raise RewriteError("keep-file は文字列のJSON配列にしてください。")
         inputs.append(args.keep_file)
     paths = output_paths(output)
     preflight_output(paths, inputs + [KEY_FILE])
-    model = args.model or os.environ.get("GEMINI_REWRITE_MODEL", DEFAULT_MODEL)
+    model, model_source = resolve_model(args.model)
     if not re.fullmatch(r"gemini-[a-zA-Z0-9.-]+", model):
         raise RewriteError("モデルIDの形式が不正です。")
+    print(f"モデル: {model}（設定元: {model_source}）", file=sys.stderr)
     payload, locks = build_payload(source, brief, style, keep, args.mode, args.thinking, args.max_output_tokens)
     if args.dry_run:
         return {"api_called": False, "model_requested": model, "mode": args.mode,
                 "thinking": args.thinking, "request_bytes": len(json.dumps(payload, ensure_ascii=False).encode("utf-8")),
                 "protected_literal_count": len(locks), "output_files": [str(x) for x in paths]}
-    data = request_gemini(payload, get_api_key(), model, args.timeout, args.retries)
-    rewritten, meta = extract_text(data)
-    audit = inspect_rewrite(source, rewritten, locks)
+    started = time.monotonic()
+    try:
+        data = request_gemini(payload, get_api_key(), model, args.timeout, args.retries)
+        rewritten, meta = extract_text(data)
+        audit = inspect_rewrite(source, rewritten, locks)
+    except RewriteError as exc:
+        failure = write_failure_report(output, model, args.mode, args.thinking, started, exc)
+        if failure:
+            print(f"診断レポート: {failure}", file=sys.stderr)
+        raise
     report = {"created_at": datetime.now(timezone.utc).isoformat(), "api_called": True,
-              "model_requested": model, "mode": args.mode, "thinking": args.thinking,
+              "model_requested": model, "model_source": model_source, "mode": args.mode, "thinking": args.thinking,
               **meta, **audit}
     # Normalize the final newline for a legible unified diff; do not mutate source.
     diff = "".join(difflib.unified_diff(
@@ -354,7 +430,8 @@ def make_parser() -> argparse.ArgumentParser:
     rewrite.add_argument("--style-file", type=Path)
     rewrite.add_argument("--keep-file", type=Path)
     rewrite.add_argument("--mode", choices=tuple(MODES), default="natural")
-    rewrite.add_argument("--thinking", choices=("low", "medium", "high"), default="medium")
+    rewrite.add_argument("--thinking", choices=("low", "medium", "high"), default="low",
+                         help="既定low。構成変更を伴う編集だけmedium以上を明示")
     rewrite.add_argument("--model", help="既定はgemini-3.8-flash。モデル変更はユーザー明示時だけ")
     rewrite.add_argument("--max-output-tokens", type=int, default=32768)
     rewrite.add_argument("--timeout", type=float, default=180)
@@ -371,8 +448,11 @@ def main(argv: list[str] | None = None) -> int:
             configure_key(args.replace)
         elif args.command == "check":
             get_api_key()
-            print(json.dumps({"python": sys.version.split()[0], "api_key_available": True,
-                              "api_called": False, "model_default": os.environ.get("GEMINI_REWRITE_MODEL", DEFAULT_MODEL)}, ensure_ascii=False))
+            model, model_source = resolve_model(None)
+            print(json.dumps({"python": sys.version.split()[0], "local_config": "passed",
+                              "api_key_available": True, "api_key_valid": "not_checked",
+                              "connectivity": "not_checked", "model_access": "not_checked",
+                              "api_called": False, "model": model, "model_source": model_source}, ensure_ascii=False))
         else:
             if not 1 <= args.max_output_tokens <= 65536:
                 raise RewriteError("max-output-tokens は1〜65536で指定してください。")
