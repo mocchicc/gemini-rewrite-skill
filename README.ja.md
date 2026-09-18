@@ -26,7 +26,8 @@ python3 install.py
 配置先は以下です。スクリプトはAPI通信をせず、既存のSkillも無断で上書きしません。
 
 ```text
-~/.agents/skills/gemini-rewrite/          # Skill本体：Codex用
+~/.agents/skills/gemini-rewrite/          # Skill本体
+~/.codex/skills/gemini-rewrite            # 上記へのシンボリックリンク：Codex用
 ~/.claude/skills/gemini-rewrite           # 上記へのシンボリックリンク：Claude Code用
 ```
 

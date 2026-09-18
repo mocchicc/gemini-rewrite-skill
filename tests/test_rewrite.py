@@ -31,7 +31,7 @@ class RewriteTests(unittest.TestCase):
 
     def test_payload_uses_current_config(self):
         p, _ = r.build_payload("元の文章です。", "自然に", "", [], "natural", "medium", 32768)
-        self.assertEqual(p["generationConfig"], {"maxOutputTokens": 32768, "thinkingConfig": {"thinkingLevel": "MEDIUM"}})
+        self.assertEqual(p["generationConfig"], {"maxOutputTokens": 32768, "thinkingConfig": {"thinkingLevel": "medium"}})
         self.assertNotIn("tools", p)
 
     def test_source_is_json_data(self):
@@ -59,6 +59,11 @@ class RewriteTests(unittest.TestCase):
 
     def test_unclosed_code_block(self):
         self.assertEqual(r.code_blocks("前\n```\nx\n"), ["```\nx"])
+
+    def test_url_lock_excludes_japanese_punctuation(self):
+        locks = r.protected_literals("詳細は https://example.com/spec。次に、", [])
+        self.assertIn("https://example.com/spec", locks)
+        self.assertNotIn("https://example.com/spec。", locks)
 
     def test_url_lock(self):
         source = "参照 https://example.com/a?b=1 と説明。"
@@ -261,6 +266,9 @@ class RewriteTests(unittest.TestCase):
             self.assertTrue((codex / "SKILL.md").is_file())
             self.assertTrue(claude.is_symlink())
             self.assertEqual(codex.resolve(), claude.resolve())
+            codex_link = Path(d) / ".codex/skills/gemini-rewrite"
+            self.assertTrue(codex_link.is_symlink())
+            self.assertEqual(codex.resolve(), codex_link.resolve())
             with self.assertRaises(RuntimeError):
                 installer.install(Path(d))
 

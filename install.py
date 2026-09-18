@@ -15,25 +15,28 @@ def install(home: Path, replace: bool = False) -> tuple[Path, Path]:
     source = Path(__file__).resolve().parent / "gemini-rewrite"
     codex = home.expanduser().resolve() / ".agents" / "skills" / "gemini-rewrite"
     claude = home.expanduser().resolve() / ".claude" / "skills" / "gemini-rewrite"
+    # Codex CLI は ~/.codex/skills を読むため、そこにもリンクを張る
+    codex_link = home.expanduser().resolve() / ".codex" / "skills" / "gemini-rewrite"
     if not (source / "SKILL.md").is_file():
         raise RuntimeError("同梱のgemini-rewrite/SKILL.mdが見つかりません。ZIP全体を展開してください。")
-    if source.resolve() in (codex.resolve(), claude.resolve()):
+    if source.resolve() in (codex.resolve(), claude.resolve(), codex_link.resolve()):
         raise RuntimeError("インストール元とインストール先を別の場所にしてください。")
-    for dest in (codex, claude):
+    for dest in (codex, claude, codex_link):
         if os.path.lexists(dest) and not replace:
             raise RuntimeError(f"既存のSkillがあります: {dest}\n更新する場合だけ --replace を指定してください。既存版はバックアップされます。")
     codex.parent.mkdir(parents=True, exist_ok=True)
     claude.parent.mkdir(parents=True, exist_ok=True)
+    codex_link.parent.mkdir(parents=True, exist_ok=True)
     # Backups stay outside skills/ so the host does not load duplicate skills.
     backup_root = home.expanduser().resolve() / ".local" / "share" / "gemini-rewrite-backups"
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
     backups: list[tuple[Path, Path]] = []
     staged = Path(tempfile.mkdtemp(prefix=".rewrite-stage-", dir=codex.parent))
-    installed_codex, installed_claude = False, False
+    installed_codex, installed_claude, installed_codex_link = False, False, False
     try:
         shutil.copytree(source, staged, dirs_exist_ok=True,
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store"))
-        for label, dest in (("codex", codex), ("claude", claude)):
+        for label, dest in (("codex", codex), ("claude", claude), ("codex-link", codex_link)):
             if os.path.lexists(dest):
                 backup_root.mkdir(parents=True, exist_ok=True, mode=0o700)
                 backup = backup_root / f"{stamp}-{label}"
@@ -43,7 +46,11 @@ def install(home: Path, replace: bool = False) -> tuple[Path, Path]:
         installed_codex = True
         claude.symlink_to(codex, target_is_directory=True)
         installed_claude = True
+        codex_link.symlink_to(codex, target_is_directory=True)
+        installed_codex_link = True
     except BaseException:
+        if installed_codex_link:
+            codex_link.unlink(missing_ok=True)
         if installed_claude:
             claude.unlink(missing_ok=True)
         if installed_codex:
@@ -69,7 +76,8 @@ def main() -> int:
     except (OSError, RuntimeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    print(f"Codex: {codex}\nClaude Code: {claude} -> {codex}")
+    codex_link = args.home.expanduser().resolve() / ".codex" / "skills" / "gemini-rewrite"
+    print(f"Skill本体: {codex}\nCodex: {codex_link} -> {codex}\nClaude Code: {claude} -> {codex}")
     print("Skillを配置しました。APIキーの設定と実APIによる疎通確認は未実施です。")
     return 0
 

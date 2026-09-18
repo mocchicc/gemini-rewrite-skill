@@ -57,7 +57,8 @@ python3 install.py
 
 ```text
 ~/.agents/skills/gemini-rewrite/   ← Skill 本体
-~/.claude/skills/gemini-rewrite    ← 上記へのシンボリックリンク
+~/.codex/skills/gemini-rewrite     ← 上記へのシンボリックリンク（Codex 用）
+~/.claude/skills/gemini-rewrite    ← 上記へのシンボリックリンク（Claude Code 用）
 ```
 
 既存の同名 Skill がある場合は、勝手に上書きせず停止します。

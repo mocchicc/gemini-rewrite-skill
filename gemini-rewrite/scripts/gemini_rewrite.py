@@ -135,7 +135,7 @@ def protected_literals(source: str, keep: list[str]) -> list[str]:
     for item in keep:
         if not item or item not in source:
             raise RewriteError("維持指定の文字列が原文にありません。keep設定を確認してください。")
-    urls = re.findall(r"https?://[^\s<>\"'\)\]`]+", source)
+    urls = re.findall(r"https?://[^\s<>\"'\)\]`。、）」]+", source)
     inline = re.findall(r"(?<!`)`[^`\n]+`(?!`)", source)
     citations = re.findall(r"\[\^?\d+\]", source)
     return list(dict.fromkeys(keep + urls + inline + citations + code_blocks(source)))
@@ -159,7 +159,7 @@ def build_payload(source: str, brief: str, style: str, keep: list[str], mode: st
         "contents": [{"role": "user", "parts": [{"text": json.dumps(task, ensure_ascii=False)}]}],
         "generationConfig": {
             "maxOutputTokens": max_output_tokens,
-            "thinkingConfig": {"thinkingLevel": thinking.upper()},
+            "thinkingConfig": {"thinkingLevel": thinking},  # 公式REST例に合わせて小文字
         },
     }
     # Do not set temperature, topP, topK, candidateCount, or thinkingBudget.
